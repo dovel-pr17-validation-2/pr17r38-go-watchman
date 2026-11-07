@@ -1,0 +1,91 @@
+version: '3'
+
+services:
+
+  # Optional address parser sidecar. Not started by default (make setup).
+  #   docker compose --profile deepparse up -d
+  # Then set Watchman.Deepparse.Enabled=true and BaseURL=http://localhost:8000
+  # (or DEEPPARSE_URL). Image: ghcr.io/graal-research/deepparse:1.0.0
+  # (linux/amd64). The entrypoint loads BPEmb only.
+  #
+  # The image runs as uid 1000 (appuser). A named volume over ~/.cache is
+  # root-owned on first create, so an init container chowns it first.
+  deepparse-cache-init:
+    profiles: ["deepparse"]
+    image: ghcr.io/graal-research/deepparse:1.0.0
+    platform: linux/amd64
+    user: "0"
+    volumes:
+      - deepparse-cache:/home/appuser/.cache
+    command: ["chown", "-R", "1000:1000", "/home/appuser/.cache"]
+
+  deepparse:
+    profiles: ["deepparse"]
+    image: ghcr.io/graal-research/deepparse:1.0.0
+    platform: linux/amd64
+    depends_on:
+      deepparse-cache-init:
+        condition: service_completed_successfully
+    command: python /entrypoint.py
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs')",
+        ]
+      interval: 15s
+      start_period: 300s
+      timeout: 10s
+      retries: 60
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./scripts/deepparse-entrypoint.py:/entrypoint.py:ro
+      - deepparse-cache:/home/appuser/.cache
+    environment:
+      HF_HOME: /home/appuser/.cache/huggingface
+      TRANSFORMERS_CACHE: /home/appuser/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+    networks:
+      - intranet
+
+  # Containers used for testing
+  mysql:
+    image: mysql:26.10.0
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_DATABASE=watchman
+      - MYSQL_USER=watchman
+      - MYSQL_PASSWORD=watchman
+      - MYSQL_ROOT_PASSWORD=root
+    networks:
+      - intranet
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    tmpfs: # Run this mysql in memory as its used for testing
+      - /var/lib/mysql
+
+  postgres:
+    image: postgres:18
+    restart: always
+    shm_size: 128mb
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=watchman
+      - POSTGRES_USER=watchman
+      - POSTGRES_PASSWORD=watchman
+    networks:
+    - intranet
+
+volumes:
+  deepparse-cache: {}
+
+networks:
+  intranet: {}

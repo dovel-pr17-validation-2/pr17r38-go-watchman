@@ -1,0 +1,83 @@
+---
+layout: page
+title: Go library
+hide_hero: true
+show_sidebar: false
+menubar: docs-menu
+---
+
+# Go library
+
+Call a running Watchman over HTTP with [`pkg/search`](https://pkg.go.dev/github.com/moov-io/watchman/pkg/search). Same query model as `/v2/search`. [Using Watchman](/watchman/using-watchman/) has the field and `minMatch` recipe.
+
+Hashed blocking keys for your own database: [`pkg/recordlink`](https://pkg.go.dev/github.com/moov-io/watchman/pkg/recordlink) (`Keys`, `Prefixes`). See [Record linkage](/watchman/record-linkage/).
+
+[![GoDoc](https://pkg.go.dev/badge/github.com/moov-io/watchman?utm_source=godoc)](https://pkg.go.dev/github.com/moov-io/watchman/pkg/search#Client)
+
+Start by running Watchman locally.
+
+```
+INCLUDED_LISTS=us_ofac go run ./cmd/server
+```
+
+Then run this example code (e.g. `go run ./examples/search.go`).
+
+{% raw %}
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/moov-io/watchman/pkg/search"
+)
+
+func main() {
+	client := search.NewClient(nil, "http://localhost:8084")
+	ctx := context.Background()
+
+	// List the currently loaded sanction lists (from /v2/listinfo)
+	info, err := client.ListInfo(ctx)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("loaded %d list(s): %v\n\n", len(info.Lists), info.Lists)
+
+	// Search using the unified entity query model (mirrors /v2/search)
+	birthDate := time.Date(1993, time.April, 17, 0, 0, 0, 0, time.UTC)
+	query := search.Entity[search.Value]{
+		Name: "Dmitry Khoroshev",
+		Type: search.EntityPerson,
+		Person: &search.Person{
+			BirthDate: &birthDate,
+			GovernmentIDs: []search.GovernmentID{{
+				Type:       search.GovernmentIDPassport,
+				Country:    "RU",
+				Identifier: "2018278055",
+			}},
+		},
+	}
+	opts := search.SearchOpts{
+		Limit:         5,
+		MinMatch:      0.80,
+		DebugMinMatch: 0.80, // field-level pieces on hits at or above 0.80
+		// Algorithm: search.AlgorithmEditex, // optional; default is Jaro-Winkler.
+		// Also: AlgorithmSoundex, AlgorithmSoftBidist, AlgorithmSoftBisim,
+		// AlgorithmNSim, AlgorithmNSim3, AlgorithmDoubleMetaphone, AlgorithmBeiderMorse.
+	}
+
+	resp, err := client.SearchByEntity(ctx, query, opts)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Results for: %v\n", resp.Query.Name)
+
+	for _, e := range resp.Entities {
+		fmt.Printf("  match=%.4f %s (%s) from %s\n", e.Match, e.Name, e.Type, e.Source)
+	}
+}
+```
+{% endraw %}

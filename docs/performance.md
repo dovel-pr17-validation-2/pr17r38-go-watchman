@@ -1,0 +1,107 @@
+---
+layout: page
+title: Performance
+hide_hero: true
+show_sidebar: false
+menubar: docs-menu
+---
+
+# Performance
+
+Watchman screens from an **in-memory index**. After OFAC (and EU, UK, UN, CSL, and the other downloaded lists) finish loading, `/v2/search` picks candidates from RAM — source/type partitions, name-token postings, ID blocks — and scores them in process. A typed name-and-passport query does not wait on a database round-trip. That is why onboarding and refresh stay fast when many searches run at once.
+
+A database is **optional**:
+
+| What | Where it lives |
+|------|----------------|
+| Downloaded government lists | Memory only. No MySQL or Postgres required to search them. |
+| Restart | Lists load again from the origin, `INITIAL_DATA_DIRECTORY`, or [watchman-cache](/watchman/cache-data-files/). |
+| Ingested files | Every row is loaded into a second in-memory corpus with the same indexes. MySQL or Postgres holds the rows and a per-source checksum so they survive restart and so search does not scan the table on every query. See [Ingest](/watchman/ingest/). |
+| Geocoding L2 / embeddings SQL cache | Optional database when you enable those features. |
+
+Knobs: [Configuration](/watchman/config/). How the index is built: [Indexing](/watchman/indexing/).
+
+On startup Watchman downloads and prepares lists (OFAC people are reordered, `MADURO MOROS, Nicolas` → `Nicolas MADURO MOROS`). Search then uses those prepared fields. Scores are 0 to 1; `minMatch=0.80` is the usual screening line.
+
+**Docker images and Linux/macOS GitHub releases** parse addresses with [libpostal](https://github.com/openvenues/libpostal) (Senzing data), about **3GB of models**. Size the host for that plus the list corpus. [deepparse](/watchman/config/#deepparse) can parse query addresses over HTTP instead; the sidecar still needs CPU and a model cache on first start.
+
+## How a search is executed
+
+Each `/v2/search` request roughly follows this path:
+
+1. **Parse and normalize** the query (names, addresses, IDs).
+2. **Select candidates** from the in-memory corpus (downloaded lists, plus ingested files when those are loaded) using prebuilt indexes (see [Indexing](/watchman/indexing/)).
+3. **Admission control** (only when the candidate set is large — see below).
+4. **Score candidates** with Jaro-Winkler similarity (and optional TF-IDF weighting), in parallel when needed.
+5. **Keep a top-N heap** of the best matches above `minMatch` (by corpus index, then copy only those entities), then return JSON.
+
+Candidate selection is **recall-safe relative to a full source/type partition scan**: if name tokens do not hit the inverted index (for example a pure typo with no shared tokens), Watchman falls back to scoring the entire matching partition rather than returning empty results.
+
+Empty partitions (for example `type=aircraft` when that source has no aircraft) return **no candidates** — Watchman does not fall back to scanning unrelated sources or types.
+
+### Candidate selection
+
+On every list refresh Watchman builds:
+
+| Structure | Purpose |
+|-----------|---------|
+| **Source × type partitions** | Restrict scoring to the requested `source` and/or `type` when provided |
+| **Name-token inverted index** | Entities whose prepared primary, alt, or former names contain a query token. Search intersects **distinctive** tokens by document frequency in this partition (no language-specific suffix list), so extra common legal-form words in any language do not drop a DBA that omits them. |
+| **Exact prepared-name map** | Fast path when the full prepared name matches exactly |
+| **Crypto address map** | Exact `CURRENCY:address` lookup for crypto-only (or crypto+name) queries |
+| **Blocking keys** | Hashed `GOVID:` / `ADDR:` postings, plus plaintext IMO/MMSI/serial/email/phone/website/SWIFT/BIC indexes for prefix and QWERTY-near typed queries, plus exact PSL domain keys (see [Record linkage](/watchman/record-linkage/)) |
+| **TF-IDF term weights** (optional) | Precomputed per-entity weights so search does not recompute IDF on every comparison |
+
+**Tips for faster queries**
+
+- Always send `type=` (and `source=` when you only need one list). This shrinks the partition before token lookup.
+- Prefer multi-token names when possible; shared tokens are intersected so common words do not pull in the rest of the partition.
+- Crypto-only queries use the exact address index and do **not** expand to a full partition scan.
+- Identifier-heavy queries: government IDs are exact lookups; IMO, MMSI, serial, email, phone, website, and SWIFT/BIC also match prefixes and a single adjacent-keyboard typo. `domain=` matches every DNS label down to eTLD+1. A matching passport, IMO, or SWIFT/BIC still scores 1.0.
+
+### Concurrency model
+
+Watchman uses two layers of concurrency control:
+
+1. **Admission control (`SEARCH_MAX_IN_FLIGHT`)** — limits how many *large* searches run at once (default: `GOMAXPROCS`). Candidate selection runs **before** the semaphore. When the candidate set has **100 or fewer** entities (exact crypto hits, tightly pruned name queries, empty partitions), the search **bypasses** the queue so fast lookups are not blocked behind full-partition scans. Larger candidate sets acquire a slot; extra requests wait rather than oversubscribing every CPU with stacked worker pools.
+
+2. **Per-search worker pool** — each search fans out scoring across a dynamic number of goroutines (`Search.Goroutines` in config, or a fixed `SEARCH_GOROUTINE_COUNT`). A feedback loop (concurrency champion) adjusts the worker count based on recent search durations for stable latency on shared hardware.
+
+**Worker sizing**
+
+- If there is only one worker (common after heavy pruning), scoring writes directly into the final top-K heap — no per-worker buffers or merge step.
+- With multiple workers, each maintains a **local top-K** and merges into the final result set after scoring, avoiding a shared mutex on every entity comparison.
+
+As shown in the first graph below, which tracks search requests per second (req/s) over time, Watchman maintains consistent query performance despite fluctuating load.
+
+![Graph 1: Stable query times with search req/s over time](../images/stable-response-times.png)
+
+The second graph shows Watchman moving the per-search worker count as load changes, which keeps scoring time steady on shared hardware. Send `type` (and IDs when you have them): that shrinks the candidate set so more searches skip the admission queue.
+
+![Graph 2: Dynamic adjustment of goroutine group sizes for optimal scoring time](../images/dynamic-goroutines.png)
+
+## Scoring hot path
+
+Similarity scoring is allocation-conscious for bulk search:
+
+- Score pieces are computed on the stack for the non-debug path.
+- Jaro-Winkler token-pair scratch buffers are pooled across comparisons.
+- Alternate and historical names are skipped once the primary (or a prior alias) already scores at or above the exact-match threshold.
+- Unique identity keys (passport, national ID, IMO/MMSI, aircraft serial, crypto address, SWIFT/BIC) that match **exactly** (identifier and country) still return 1.0 immediately and skip name/title/address comparison. Tax IDs, business registrations, and contact (email/phone/website/domain) are weighted evidence only — they never force 1.0. When both records populate the same ID type (and country, if both set) with **different** values, the blended score is multiplied by `ID_CONFLICT_PENALTY_MULTIPLIER` (default 0.70).
+- Person/business/organization type mismatches recast the query onto the index type (~+100 ns and +1 alloc vs same-type scoring on Apple M4 Max). Vessel/aircraft mismatches still return 0 with no alloc. Typed search partitions are unchanged.
+- Former names and related prepared fields are normalized at index time (and query normalize), not on every comparison.
+- Optional TF-IDF weights are attached to index entities when lists load; query weights are computed once per search.
+- Jaro-Winkler feature flags (`DISABLE_PHONETIC_FILTERING`, `USE_SOUNDEX_MATCHING`, `SOUNDEX_BOOST_WEIGHT`) are read at process start (see [Similarity Configuration](/watchman/config/#similarity-configuration)). Changing them requires a restart. Individual searches can still select `?algorithm=` without a restart (see [Algorithm comparison](/watchman/algorithm-comparison/)).
+
+Debug mode (`debug=true` or `debug=0.80`) computes field-level score pieces after ranking, and only for returned hits that meet the threshold. It still allocates extra buffers per attached hit, so leave it off unless you need the breakdown.
+
+## Related configuration
+
+| Variable / setting | Role |
+|--------------------|------|
+| `SEARCH_MAX_IN_FLIGHT` | Max concurrent *large* searches (admission control); default `GOMAXPROCS`. Candidate sets ≤ 100 skip the queue. |
+| `SEARCH_GOROUTINE_COUNT` | Fixed workers per search; empty = dynamic champion |
+| `Search.Goroutines` | Default / min / max for dynamic workers |
+| `TFIDF_ENABLED` | Optional name-term weighting (index-time weights) |
+
+See the full [Configuration Guide](/watchman/config/) and [Indexing](/watchman/indexing/) pages for details.
